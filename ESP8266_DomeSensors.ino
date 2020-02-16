@@ -33,7 +33,7 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <EEPROM.h>
 #include <EEPROMAnything.h>
-#include <GDBStub.h>
+#include <GDBStub.h> //Debugging stub for GDB
 
 //Publishing function definitions
 bool publishDHT(void);
@@ -75,6 +75,8 @@ char* myHostname             = "espSEN01";
 WiFiClient espClient;
 PubSubClient client(espClient);
 volatile bool callbackFlag = 0;
+//Used by MQTT reconnect
+volatile bool timerSet  = false;
 
 // Create an instance of the server
 // specify the port to listen on as an argument
@@ -89,6 +91,7 @@ ETSTimer timer, timeoutTimer;
 volatile bool newDataFlag = false;
 volatile bool timeoutFlag = false;
 
+
 //Processor time
 double usProfileTimeCount = 0;
 long int startTime; //Time when profile was activated
@@ -96,15 +99,18 @@ long int currentTime;//Time of last profile index update
 //long int nowTime = system_get_time();
 
 void onTimer(void);
+void syncTime();
 String& getTimeAsString(String& );
+String& getTimeAsString2(String& );
 void callback(char* topic, byte* payload, unsigned int length) ;
 void reconnect( void );
-void publishStuff( void );
+void reconnectNB( void );
 
 //Web Handler function definitions
 void handleRoot(void);
 void handleNotFound();
 void handleBearingGet();
+void handleOffsetsPut();
 
 //Presence markers
 bool dht11Present = false;
@@ -207,9 +213,6 @@ void setup()
 
   //Start NTP client
   configTime(TZ_SEC, DST_SEC, "pool.ntp.org");
-
-  //Setup timestruct
-  now = time(nullptr);
 
   //Setup defaults first - via EEprom.
   //TODO
@@ -325,6 +328,7 @@ void setup()
   //Setup webserver handler functions
   server.on("/", handleRoot);
   server.on("/bearing", HTTP_GET, handleBearingGet );
+  server.on("/offsets", HTTP_PUT, handleOffsetsPut );
   //server.on("/bearing/reset", HTTP_GET, handleBearingResetGet );
   server.onNotFound(handleNotFound);
 
@@ -335,7 +339,8 @@ void setup()
   //Setup timers
   //setup interrupt-based 'soft' alarm handler for periodic acquisition of new bearing
   ets_timer_setfn( &timer, onTimer, NULL );
-
+  ets_timer_setfn( &timeoutTimer, onTimeoutTimer, NULL ); 
+  
   //fire timer every 250 msec
   //Set the timer function first
   ets_timer_arm_new( &timer, 500, 1/*repeat*/, 1);
@@ -383,11 +388,11 @@ void loop()
     if ( dht11Present )
     {
       loopCount++;
-      if ( loopCount == 2 )
+      if ( loopCount == 4 )
       {
         humidity  = dht.getHumidity();
       }
-      if ( loopCount >= 4 )
+      if ( loopCount >= 8 )
       {
         aTemperature = dht.getTemperature();
         dewpoint = dht.computeDewPoint( aTemperature, humidity, false );
@@ -452,36 +457,36 @@ void loop()
       Serial.printf("RAM: %d  change %d\n", ram, lastRam );
     }
   }
-
-  else if (callbackFlag == true )
+  if ( client.connected() )
   {
-    //publish results
-    //Reset flags after last loop - also reset publish flag
-    if ( client.connected() )
+    if (callbackFlag == true )
     {
-       for ( i=0; i<8; i++ )
-       {
-          if( sensorPresence & (1 << i) )
-          {
-            pubFuncs[i]();
-          }
-          delay(1);
-       }
-      publishHealth();
-      callbackFlag = false;
-      DEBUGSL1("Callback response:");     
+      //publish results
+      //Reset flags after last loop - also reset publish flag
+      if ( client.connected() )
+      {
+         for ( i=0; i<8; i++ )
+         {
+            if( sensorPresence & (1 << i) )
+            {
+              (*pubFuncs[i])();
+            }
+            delay(1);
+         }
+        publishHealth();
+        callbackFlag = false;
+        DEBUGSL1("Callback response:");     
+      }
     }
-    else
-    {
-      reconnect();
-      //Service MQTT keep-alives
-    }
+    client.loop();
   }
-
+  else 
+  {
+    reconnectNB();
+  }
+  
   //Handle web requests
   server.handleClient();
-
-  client.loop();
   
   //Time profiling
   //currentTime = system_get_time();
@@ -503,13 +508,59 @@ void handleNotFound()
   server.send(404, "text/plain", message);
 }
 
+void handleOffsetsPut()
+{
+  String timeString = "", message = "";
+  DynamicJsonBuffer jsonBuffer(400);
+  JsonObject& root = jsonBuffer.createObject();
+  String sOffsets[3];
+  int iOffsets[3] = {0,0,0};
+  int status = 0;
+  int i = 0;
+
+  root["time"] = getTimeAsString( timeString );
+
+  if (server.hasArg("Xoffset") && server.hasArg("Yoffset") && server.hasArg("Zoffset") )
+  {
+    iOffset[0] = server.arg("Xoffset").toInt();
+    iOffset[1] = server.arg("Yoffset").toInt();
+    iOffset[2] = server.arg("Zoffset").toInt();
+    for (status = 0, i = 0; i < 3; i++ )
+    {
+      //Check for in range - mark if not
+      if ( abs(iOffset) > 10000 )
+        status |= 1;
+    }
+    if( !status )
+    {
+      //update the magnetometer offsets
+      qCompass.setOffset( iOffset[0], iOffset[1], iOffset[2] );
+      root["message"] = "Offsets updated" ;
+      root.printTo( message );
+      status = 200;
+    }
+    else
+    {
+      root["message"] = "Offsets out of range" ;
+      status = 404;
+    }      
+  }
+  else
+  {
+    root["message"] = "Offsets not found" ;
+    status = 404;
+  }
+  root.printTo( message);
+  server.send( status, "application/json", message);        
+}
+
 void handleBearingGet()
 {
   String timeString = "", message = "";
   DynamicJsonBuffer jsonBuffer(400);
   JsonObject& root = jsonBuffer.createObject();
 
-  root["time"]     = getTimeAsString( timeString );
+  root["time"]     = getTimeAsString2( timeString );
 
 #if defined _QMC5883L_INCLUDED_
 #if defined _CMPS03_INCLUDED_
@@ -554,7 +605,7 @@ void handleRoot()
   DynamicJsonBuffer jsonBuffer(256);
   JsonObject& root = jsonBuffer.createObject();
 
-  root["time"] = getTimeAsString( timeString );
+  root["time"] = getTimeAsString2( timeString );
 #if defined _DHT11_INCLUDED_
   if ( dht11Present )
   {
@@ -635,7 +686,6 @@ void callback(char* topic, byte* payload, unsigned int length)
 {
   //set callback flag
   callbackFlag = true; 
-  DEBUGSL1("Callback received");
 }
 
 bool publishHealth(void)
@@ -645,10 +695,13 @@ bool publishHealth(void)
   JsonObject& root = jsonBuffer.createObject();
   String outString;
   String outTopic;
+  String timestamp;
 
   DEBUGSL1( "Entered publishHealth" );
+  getTimeAsString2( timestamp );
   //Put a notice out regarding device health
   root["hostname"] = myHostname;
+  root["timestamp"] = timestamp;
   root["message"] = String( "Measurement published" );
   root.printTo( outString );
   outTopic = outHealthTopic;
@@ -657,8 +710,7 @@ bool publishHealth(void)
   Serial.printf( "Health topic published to %s , content: %s \n", outTopic.c_str(), outString.c_str() );
   
   DEBUGSL1( "leaving publishHealth" );
-  return pubState;
-  
+  return pubState; 
 }
 
 bool publishBMP(void)
@@ -669,10 +721,13 @@ bool publishBMP(void)
   JsonObject& root = jsonBuffer.createObject();
   String outString;
   String outTopic;
+  String timestamp;
+  timestamp = getTimeAsString2( timestamp );
 
 #if defined _BMP280_INCLUDED_
 //  DEBUGSL1( "Entered publishBMP" );
   root["sensor"] = "bmp280";
+  root["timestamp"] = timestamp;
   root["pressure"] = pressure;
 
   outTopic = outSenseTopic;
@@ -718,14 +773,16 @@ bool publishHTU(void)
 {
   bool pubState = false;
   DynamicJsonBuffer jsonBuffer(250);
-
   JsonObject& root = jsonBuffer.createObject();
   String outString;
   String outTopic;
+  String timestamp;
+  timestamp = getTimeAsString2( timestamp );
 
 #if defined _HTU21D_INCLUDED_
   //DEBUGSL1( "Entering publishHTU" );
   root["sensor"] = "HTU21D";
+  root["timestamp"] = timestamp;
   root["Humidity"] = htuHumidity;
 
   outTopic = outSenseTopic;
@@ -754,10 +811,13 @@ bool publishDHT( void )
   JsonObject& root = jsonBuffer.createObject();
   String outString;
   String outTopic;
+  String timestamp;
+  timestamp = getTimeAsString2( timestamp );
 
 #if defined _DHT11_INCLUDED_
   //DEBUGSL1( "Entering publishDHT" );
   root["sensor"] = "DHT11";
+  root["timestamp"] = timestamp;
   root["humidity"] = humidity;
   root.printTo( outString );
 
@@ -820,10 +880,13 @@ bool publishQMC(void)
   JsonObject& root = jsonBuffer.createObject();
   String outString;
   String outTopic;
+  String timestamp;
+  timestamp = getTimeAsString2( timestamp );
 
 #if defined _QMC5883L_INCLUDED_
   //DEBUGSL1( "Entering publishQMC" );
   root["sensor"] = "QMC5883L";
+  root["timestamp"] = timestamp;
 
   JsonArray& mags = root.createNestedArray("BFields");
   mags.add( raw.XAxis );
@@ -893,10 +956,13 @@ bool publishCMP(void )
   JsonObject& root = jsonBuffer.createObject();
   String outString;
   String outTopic;
+  String timestamp;
+  timestamp = getTimeAsString2( timestamp );
 
 #if defined _CMPS03_INCLUDED_
   //DEBUGSL1( "Entering publishCMP" );
   root["sensor"] = "CMPS03";
+  root["timestamp"] = timestamp;  
   root["bearing"] = cBearing;
   root.printTo( outString );
 
@@ -933,6 +999,50 @@ bool publishCMP(void )
   4 : MQTT_CONNECT_BAD_CREDENTIALS - the username/password were rejected
   5 : MQTT_CONNECT_UNAUTHORIZED - the client was not authorized to connect
 */
+void reconnectNB() 
+{
+  //Non-blocking version
+   if ( timerSet ) //timer is running but not timed out. 
+   {
+     if( timeoutFlag ) //Timeout - try again
+     {   
+         Serial.print("Repeating MQTT connection attempt...");
+         if ( !client.connect(thisID, pubsubUserID, pubsubUserPwd ) )
+         {  //Set a one-off timer to try next time around. 
+            Serial.print("connect failed, rc=");
+            Serial.println(client.state());
+            timeoutFlag = false;
+            timerSet = true;
+            ets_timer_arm_new( &timeoutTimer, 5000, 0/*one-shot*/, 1);           
+         }
+         else
+         { //Stop - all connected again
+            timerSet = false;
+         }
+      }
+   }
+   else //timer not set 
+   {
+     Serial.print("Attempting MQTT connection...");
+     if ( !client.connect(thisID, pubsubUserID, pubsubUserPwd ) )
+     {  
+        Serial.print("connect failed, rc=");
+        Serial.println(client.state());
+
+        //Set a one-off timer to try next time around. 
+        timeoutFlag = false;
+        timerSet = true;
+        ets_timer_arm_new( &timeoutTimer, 5000, 0/*one-shot*/, 1);           
+     }
+     else
+     {
+        publishHealth();
+        client.subscribe(inTopic);
+        Serial.println("MQTT connection regained.");
+     }
+   }
+return;
+}
 
 void reconnect( void )
 {
@@ -946,16 +1056,8 @@ void reconnect( void )
     if (client.connect(thisID, pubsubUserID, pubsubUserPwd ) )
     {
       //publish to our device topic(s)
-      DynamicJsonBuffer jsonBuffer(400);
-      JsonObject& root = jsonBuffer.createObject();
-
       Serial.println("connected");
-      // Once connected, publish an announcement...
-      root["hostname"] = myHostname;
-      root["message"] = "reconnected";
-      root.printTo( output );
-      client.publish( outHealthTopic, output.c_str() );
-      // ... and resubscribe
+      // Resubscribe
       client.subscribe(inTopic);
     }
     else
@@ -977,6 +1079,45 @@ void reconnect( void )
 /*
    Helper functions
 */
+void syncTime()
+{
+  //The reason to do this is that we timestamp the data with the network time. 
+  //However the network time is only recorded to the second since 1970 on the ESP8266
+  //
+  struct timeval tv;
+  gettimeofday( &tv, nullptr );  
+  
+  struct timezone tzone;
+  tzone.tz_minuteswest = 0;
+  tzone.tz_dsttime = DST_MN;
+  
+  //Look for the boundary change of second
+  time_t now, last;
+  now = time(nullptr);
+  struct tm* gnow = gmtime( &now );
+  tv.tv_sec = (((gnow->tm_hour*60) + gnow->tm_min )*60) + gnow->tm_sec;
+  last = now;
+  while( ( now - last ) == 0 )
+  {
+      last = now;
+      now = time( nullptr );
+  }
+
+  //As soon as gmtime seconds change - update the system clock usec counter.
+  tv.tv_usec = 0;
+  settimeofday( &tv, &tzone );
+}
+ 
+String& getTimeAsString2(String& output)
+{
+   //relies on the system clock being synchronised with the sntp clock at the ms level. 
+   char buf[64];
+   now = time( nullptr );
+   sprintf( buf, "%lu%03i", now + (millis() % 1000 ) );
+   output = String( buf);
+   return output;
+}
+
 String& getTimeAsString(String& output)
 {
   /* ISO Dates (Date-Time)
