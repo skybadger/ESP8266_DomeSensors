@@ -18,8 +18,12 @@
   GPIO 4,2 to SDA
   GPIO 5,0 to SCL
   All 3.3v logic.
-*/
+Ensure to use lwip higher bandwidth options at build time. 
+Some routers and networks don;t like the smaller MTU size of the lower bandwidth option - below 520 bytes, and drop the SYN
+which means connect http client fails. 
+Tested with lwip1.4 higher bandwidth on v2.6.3
 
+*/
 #include "ProjectDefs.h"
 #include "DebugSerial.h"
 #include <esp8266_peri.h> //register map and access
@@ -49,7 +53,7 @@ int sensorPresence = 0;
 int reportFlags = 0;
 bool (*pubFuncs[8])(void) = { publishDHT, publishHTU, publishBMP, publishQMC, publishCMP, NULL, NULL, NULL };
 
-#define _DHT11_INCLUDED_    0x01   //Self-detection doesn't work
+//#define _DHT11_INCLUDED_    0x01   //Self-detection doesn't work
 #define _HTU21D_INCLUDED_   0x02
 #define _BMP280_INCLUDED_   0x04
 #define _QMC5883L_INCLUDED_ 0x08   //Self-detection doesn't work
@@ -63,7 +67,7 @@ time_t now; //use as 'gmtime(&now);'
 
 //Wifi and MQTT settings stay out of Git.
 #include "SkybadgerStrings.h"
-const char* defaultHostname = "espSEN00";
+const char* defaultHostname = "espSEN01";
 char* thisID;
 char* myHostname;
 int* iOffsets;
@@ -96,6 +100,7 @@ long int currentTime;//Time of last profile index update
 //Program function definitions
 void onTimer(void);
 void callback(char* topic, byte* payload, unsigned int length) ;
+float getDewpoint( float temperature, float humidity );
 
 //Presence markers - should replace with bit masked flag below but that is not scaleable.
 bool dht11Present = false;
@@ -162,14 +167,13 @@ void setup_wifi()
   //WiFi.setOutputPower( 20.5F );//full power WiFi
   //WiFi.persistent( false );
 
-  WiFi.begin(ssid1, password1 );
+  WiFi.begin(ssid2, password2 );
   Serial.print("Searching for WiFi..");
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
     Serial.print(".");
-    zz++;
-    if (zz >= 400) 
+    if (zz++ >= 400) 
     {
       device.restart();
     }    
@@ -316,6 +320,7 @@ void setup()
   server.on("/", handleRoot);
   server.on("/bearing", HTTP_GET, handleBearingGet );
   server.on("/offsets", HTTP_PUT, handleOffsetsPut );
+  server.on("/offsets", HTTP_GET, handleOffsetsGet );
   //server.on("/bearing/reset", HTTP_GET, handleBearingResetGet );
   server.onNotFound(handleNotFound);
 
@@ -689,6 +694,27 @@ bool publishDHT( void )
   //DEBUGSL1( "Leaving publishDHT" );  
 #endif
   return pubState;
+}
+
+float getDewpoint( float temperature, float humidity )
+{
+  //Simple 'Magnus formula' https://en.wikipedia.org/wiki/Dew_point
+  const float a = 6.1121; //mbar or hectoPascales
+  const float  b = 17.62; 
+  const float c = 243.12; 
+
+  float gamma = log( humidity/100 );
+  gamma += (b * temperature )/( c + temperature );
+  
+  float dewpoint = (c*gamma)/(b-gamma);
+  
+  return dewpoint;  
+
+/*
+  Simplified rule of thumb
+  
+*/
+
 }
 
 bool publishQMC(void)

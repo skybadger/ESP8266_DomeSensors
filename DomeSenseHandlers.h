@@ -35,6 +35,13 @@ void handleNotFound()
   message.concat( "Bearing read: http://");
   message.concat( myHostname );
   message.concat ( "/bearing \n");
+  message.concat( "Compass calibration Offsets read: http://");
+  message.concat( myHostname );
+  message.concat ( "/offsets \n");
+  message.concat( "Offsets update : http://");
+  message.concat( myHostname );
+  message.concat ( "/offsets?Xoffset=<>&Yoffset=<>&Zoffset=<> (PUT) range is -10,000 < integer < +10,000\n");
+  
   server.send(404, "text/plain", message);
 }
 
@@ -85,6 +92,27 @@ void handleOffsetsPut()
     root["message"] = "Offsets not found" ;
     status = 404;
   }
+  root.printTo( message);
+  server.send( status, "application/json", message);        
+}
+
+void handleOffsetsGet()
+{
+  String timeString = "", message = "";
+  DynamicJsonBuffer jsonBuffer(400);
+  JsonObject& root = jsonBuffer.createObject();
+  JsonArray& Boffsets = root.createNestedArray("offsets");
+  
+  int status = 0;
+  int i = 0;
+
+  root["time"] = getTimeAsString( timeString );
+
+  for ( i =0; i< N_OFFSETS; i++ )
+  {
+    Boffsets.add( iOffsets[i] );
+  }
+  status = 200;
   root.printTo( message);
   server.send( status, "application/json", message);        
 }
